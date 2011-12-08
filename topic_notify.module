@@ -1,0 +1,266 @@
+<?php
+/**
+ * @file
+ * Code for the Topic notify feature.
+ */
+
+include_once('topic_notify.features.inc');
+
+/**
+ * Implements hook_ctools_plugin_directory().
+ */
+function topic_notify_ctools_plugin_directory($module, $plugin) {
+  if ($module == 'ctools' && !empty($plugin)) {
+    return "plugins/$plugin";
+  }
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function topic_notify_node_insert($node) {
+  if ($node->type == 'question') {
+    // Subscribe author to topic.
+    $account = user_load($node->uid);
+    flag('flag', 'notify', $node->nid, $account);
+    topic_notify_question($node);
+  }
+}
+
+/**
+ * Capture a message on question.
+ */
+function topic_notify_question($node) {
+  $wrapper = entity_metadata_wrapper('node', $node);
+
+  $arguments = array(
+    '@topic-name' => $wrapper->field_topic_ref->label(),
+    '@topic-url' => $wrapper->field_topic_ref->url->value(),
+    '@question-title' => $wrapper->label(),
+    '@question-url' => array(
+      // Get the question URL on the fly, as the URL might be changed by
+      // the admin.
+      'callback' => 'url',
+      'callback arguments' => 'node/' . $node->nid,
+    ),
+    '@question-author' => $wrapper->author->label(),
+  );
+
+  $topic_id = $wrapper->field_topic_ref->value(array('identifier' => TRUE));
+
+  $message = message_create('digest_question_wrapper', array('arguments' => $arguments, 'uid' => $node->uid));
+  $wrapper = entity_metadata_wrapper('message', $message);
+  $wrapper->field_message_topic_ref[] = $topic_id;
+  $wrapper->save();
+}
+
+/**
+ * Implements hook_flag().
+ */
+function topic_notify_flag($action, $flag, $content_id, $account) {
+  if ($flag->name != 'notify') {
+    return;
+  }
+
+  $wrapper = entity_metadata_wrapper('user', $account);
+  if ($action == 'flag' && !$wrapper->field_send_digest->value()) {
+    $wrapper->field_send_digest->set(TRUE);
+    // Set last digest sent to now.
+    $wrapper->field_last_digest->set(time());
+    $wrapper->save();
+  }
+  elseif ($action == 'unflag') {
+    // Check if user has more flaggings.
+    $flaggings = flag_get_user_flags('node', NULL, $account->uid);
+    $remove = empty($flaggings['notify']);
+
+    if (!$remove) {
+      // Check there is a flagging on a digest related content type.
+      $nodes = node_load_multiple(array_keys($flaggings['notify']));
+      foreach ($nodes as $node) {
+        if ($node->type != 'question') {
+          $remove = TRUE;
+          break;
+        }
+      }
+    }
+
+    if ($remove) {
+      $wrapper->field_send_digest->set(0);
+      $wrapper->save();
+    }
+  }
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Process digest emails.
+ */
+function topic_notify_cron() {
+  global $language;
+
+  // Day * Hour * Minutes * Seconds.
+  $week = time() - (7 * 24 * 60 * 60);
+  // Delete old Messages.
+  // Get a range of users that need to get a digest email.
+  $query = new EntityFieldQuery();
+  $result = $query
+    ->entityCondition('entity_type', 'message')
+    ->propertyCondition('type', 'digest_question_wrapper', '=')
+    ->propertyCondition('timestamp', $week, '<')
+    ->execute();
+
+  if (!empty($result['message'])) {
+    message_delete_multiple(array_keys($result['message']));
+  }
+
+  // Calculate the timestamp of 24 hours before now.
+  $yesterday = time() - (24 * 60 * 60);
+
+  // Get a range of users that need to get a digest email.
+  $query = new EntityFieldQuery();
+  $result = $query
+    ->entityCondition('entity_type', 'user')
+    ->propertyCondition('status', '1', '=')
+    ->fieldCondition('field_last_digest', 'value', $yesterday, '<')
+    ->fieldCondition('field_send_digest', 'value', 1, '=')
+    ->propertyOrderBy('uid')
+    ->range(0, 50)
+    ->execute();
+
+  if (empty($result['user'])) {
+    return;
+  }
+
+
+  $languages = language_list();
+  $accounts = user_load_multiple(array_keys($result['user']));
+  foreach ($accounts as $account) {
+    $lang = !empty($account->language) ? $languages[$account->language] : $languages[$language->language];
+
+    $message = topic_notify_get_digest($account);
+    if (!$message) {
+      // No need to re-process the user for the next 24 hours.
+      $wrapper = entity_metadata_wrapper('user', $account);
+      $wrapper->field_last_digest->set(time());
+      $wrapper->save();
+      continue;
+    }
+
+
+    if (!$result = drupal_mail('message_notify', $message->type, $account->mail, $lang, array ('message' => $message))) {
+      // Mail was not sent succesfully.
+      watchdog('topic_notify', t('Could not send digest email.'));
+    }
+    else {
+      // Mark last digest for the user.
+      $wrapper = entity_metadata_wrapper('user', $message->uid);
+      $wrapper->field_last_digest->set(time());
+      $wrapper->save();
+    }
+  }
+}
+
+/**
+ * Get the Message entity ready for a digest email.
+ */
+function topic_notify_get_digest($account) {
+  global $language;
+  $yesterday = time() - (24 * 60 * 60);
+  $languages = language_list();
+  $lang = !empty($account->language) ? $languages[$account->language] : $languages[$language->language];
+
+  // Get the topics a user is following.
+  $flaggings = flag_get_user_flags('node', NULL, $account->uid);
+  if (empty($flaggings['notify'])) {
+    // User is not subscrbied to any content.
+    return;
+  }
+
+  // We might have question IDs here, but it's ok, as we are going to
+  // query message entities, and those are referenceing only the correct
+  // node IDs.
+  $nids = array_keys($flaggings['notify']);
+
+  $query = new EntityFieldQuery();
+  $result = $query
+    ->entityCondition('entity_type', 'message')
+    ->propertyCondition('type', 'digest_question_wrapper', '=')
+    ->propertyCondition('timestamp', $yesterday, '>')
+    ->fieldCondition('field_message_topic_ref', 'target_id', $nids, 'IN')
+    // Don't notify user about own question.
+    ->propertyCondition('uid', $account->uid, '<>')
+    ->propertyOrderBy('mid')
+    ->execute();
+
+  if (empty($result['message'])) {
+    // There are no messages for the user's topics.
+    return;
+  }
+
+  // Prepare the digst messge token.
+  $digest_token = array();
+
+
+  $messages = message_load_multiple(array_keys($result['message']));
+  $items = array();
+  foreach ($messages as $message) {
+    $wrapper = entity_metadata_wrapper('message', $message);
+    $topic_id = $wrapper->field_message_topic_ref[0]->value(array('identifier' => TRUE));
+    $items[$topic_id][] = array(
+      '@title' => $message->arguments['@question-title'],
+      '@url' => $message->arguments['@question-url'],
+    );
+    $topics[$topic_id] = $wrapper->field_message_topic_ref[0]->label();
+  }
+
+  $arguments = array(
+    '@name' => format_username($account),
+    // Get the topic digest via custom callback.
+    '!topic-digest' => array('callback' => 'topic_notify_prepare_topic_for_digest', 'callback arguments' => $items),
+    // General tokens.
+    '@site-url' => url('', array('absolute' => TRUE)),
+  );
+
+  $message = message_create('email_topic_digest', array('arguments' => $arguments, 'uid' => $account->uid));
+  $message->language = $lang->language;
+  $message->topic_items = $topics;
+  return $message;
+}
+
+/**
+ * Message callback; Prepare the topic wrapper for the digest.
+ */
+function topic_notify_prepare_topic_for_digest($arguments, Message $message) {
+  $output = array();
+  foreach ($message->topic_items as $topic_id => $topic_name) {
+    $sub_arguments = array(
+      '@topic' => $topic_name,
+      '!questions' => array(
+        'callback' => 'topic_notify_prepare_questions_for_digest',
+        'callback arguments' => array('question_ids' => $arguments[$topic_id]),
+      ),
+    );
+    $sub_message = message_create('digest_topic_wrapper', array('arguments' => $sub_arguments, 'uid' => $message->uid));
+    $sub_message->language = $message->language;
+    $element = $sub_message->buildContent('full', $message->language);
+    $output[] = $element['text']['#markup'];
+  }
+
+  return implode('', $output);
+}
+
+/**
+ * Message callback; Prepare the questions for the digest.
+ */
+function topic_notify_prepare_questions_for_digest($arguments, Message $message) {
+  $output = array();
+  foreach ($arguments['question_ids'] as $sub_arguments) {
+    $sub_message = message_create('digest_question_wrapper', array('arguments' => $sub_arguments, 'uid' => $message->uid));
+    $element = $sub_message->buildContent('full', $message->language);
+    $output[] = $element['text']['#markup'];
+  }
+
+  return implode('', $output);
+}
